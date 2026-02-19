@@ -78,6 +78,8 @@ services:
       - ./parquet_output:/app/parquet_output:ro
       - ./cleanup.sh:/app/cleanup.sh:ro
       - ./test_large_parquet_docker.py:/app/test_large_parquet_docker.py:ro
+      # Mount local dlt source so code changes are reflected instantly
+      - ../dlt:/usr/local/lib/python3.11/site-packages/dlt
     deploy:
       resources:
         limits:
