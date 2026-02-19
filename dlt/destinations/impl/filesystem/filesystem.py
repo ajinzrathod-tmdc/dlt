@@ -231,20 +231,32 @@ class DeltaLoadFilesystemJob(TableFormatLoadFilesystemJob):
 
 class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
     def run(self) -> None:
+        import gc
+        import pyarrow.parquet as pq
+        from dlt.common.libs.pyarrow import pyarrow as pa
         from dlt.common.libs.pyiceberg import (
             write_iceberg_table,
             merge_iceberg_table,
             create_table,
+            stream_iceberg_files,
         )
         from dlt.destinations.impl.filesystem.iceberg_partition_spec import (
             build_iceberg_partition_spec,
         )
 
+        logger.info(
+            f"Will copy file(s) {self.file_paths} to iceberg table"
+            f" {self.make_remote_url()} [arrow buffer: {pa.total_allocated_bytes()}]"
+        )
+
+        # Read schema from first file without loading data
+        schema = pq.read_schema(self.file_paths[0])
+
         try:
             table = self._job_client.load_open_table(
                 "iceberg",
                 self.load_table_name,
-                schema=self.arrow_dataset.schema,
+                schema=schema,
             )
         except DestinationUndefinedEntity:
             location = self._job_client.get_open_table_location("iceberg", self.load_table_name)
@@ -254,7 +266,7 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
 
             if spec_list:
                 partition_spec, iceberg_schema = build_iceberg_partition_spec(
-                    self.arrow_dataset.schema, spec_list
+                    schema, spec_list
                 )
                 create_table(
                     self._job_client.get_open_table_catalog("iceberg"),
@@ -268,25 +280,40 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
                     self._job_client.get_open_table_catalog("iceberg"),
                     table_id,
                     table_location=location,
-                    schema=self.arrow_dataset.schema,
+                    schema=schema,
                 )
-            # run again with created table
             self.run()
             return
 
+        del schema
+        gc.collect()
+
         if self._load_table["write_disposition"] == "merge" and table is not None:
-            merge_iceberg_table(
-                table=table,
-                data=self.arrow_dataset.to_table(),
-                schema=self._load_table,
-                load_table_name=self.load_table_name,
-            )
+            # Merge still needs data in memory — stream batch by batch
+            source_ds = self.arrow_dataset
+            with source_ds.scanner(
+                batch_readahead=0, fragment_readahead=0, use_threads=False
+            ).to_reader() as arrow_rbr:
+                merge_iceberg_table(
+                    table=table,
+                    data=arrow_rbr,
+                    schema=self._load_table,
+                    load_table_name=self.load_table_name,
+                )
+            del source_ds
         else:
-            write_iceberg_table(
+            # Append/replace: stream files one at a time to S3, single atomic commit
+            stream_iceberg_files(
                 table=table,
-                data=self.arrow_dataset.to_table(),
+                file_paths=self.file_paths,
                 write_disposition=self._load_table["write_disposition"],
             )
+
+        gc.collect()
+        logger.info(
+            f"Copied {self.file_paths} to iceberg table {self.make_remote_url()}"
+            f" [arrow buffer: {pa.total_allocated_bytes()}]"
+        )
 
     def _get_partition_spec_list(self) -> List["PartitionSpec"]:
         """Resolve partition specs. Combines legacy partition columns (identity transform)

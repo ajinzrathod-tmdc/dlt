@@ -76,50 +76,276 @@ def ensure_iceberg_compatible_arrow_data(data: pa.Table) -> pa.Table:
 
 def write_iceberg_table(
     table: IcebergTable,
-    data: pa.Table,
+    data: Union[pa.Table, pa.RecordBatchReader],
     write_disposition: TWriteDisposition,
 ) -> None:
     start_ts = precise_time()
-    if write_disposition == "append":
-        table.append(ensure_iceberg_compatible_arrow_data(data))
-    elif write_disposition == "replace":
-        table.overwrite(ensure_iceberg_compatible_arrow_data(data))
+
+    if isinstance(data, pa.RecordBatchReader):
+        _write_iceberg_table_streamed(table, data, write_disposition)
+    else:
+        if write_disposition == "append":
+            table.append(ensure_iceberg_compatible_arrow_data(data))
+        elif write_disposition == "replace":
+            table.overwrite(ensure_iceberg_compatible_arrow_data(data))
+        logger.debug(
+            f"pyiceberg: {write_disposition} arrow with {data.num_rows} rows to table"
+            f" {table.name()} at location {table.location()} took"
+            f" {(precise_time() - start_ts)} seconds."
+        )
+
+
+def _write_iceberg_table_streamed(
+    table: IcebergTable,
+    reader: pa.RecordBatchReader,
+    write_disposition: TWriteDisposition,
+) -> None:
+    """Streams Arrow batches to S3 as individual parquet files, then does ONE atomic Iceberg commit.
+
+    Memory stays constant: only one batch + one parquet file in memory at a time.
+    Only lightweight file path metadata is accumulated.
+    """
+    import gc
+    import uuid
+    import tempfile
+
+    import pyarrow.parquet as pq
+    from pyiceberg.io.pyarrow import parquet_files_to_data_files
+
+    start_ts = precise_time()
+    data_location = f"{table.location()}/data"
+    s3_paths: List[str] = []
+    total_rows = 0
+    batch_count = 0
+
+    for batch in reader:
+        batch_count += 1
+        batch_table = ensure_iceberg_compatible_arrow_data(pa.Table.from_batches([batch]))
+
+        # Write batch to a local temp file
+        temp_path = tempfile.mktemp(suffix=".parquet")
+        pq.write_table(batch_table, temp_path, compression="snappy")
+
+        # Upload to S3 via Iceberg's IO layer
+        s3_path = f"{data_location}/batch-{uuid.uuid4()}.parquet"
+        with open(temp_path, "rb") as fh:
+            output = table.io.new_output(s3_path)
+            with output.create() as s3_file:
+                s3_file.write(fh.read())
+
+        os.remove(temp_path)
+        s3_paths.append(s3_path)
+        total_rows += batch_table.num_rows
+        del batch_table
+
+        if batch_count % 10 == 0:
+            gc.collect()
+            logger.debug(
+                f"pyiceberg: streamed {batch_count} batches, {total_rows} rows so far"
+            )
+
+    # Convert written parquet files to Iceberg DataFile objects (metadata only, no data read)
+    data_files = list(
+        parquet_files_to_data_files(
+            io=table.io,
+            table_metadata=table.metadata,
+            file_paths=s3_paths,
+        )
+    )
+
+    # Single atomic commit
+    if write_disposition == "replace":
+        existing_files = []
+        if table.current_snapshot():
+            existing_files = [task.file for task in table.scan().plan_files()]
+
+        with table.transaction() as txn:
+            update = txn.update_snapshot().overwrite()
+            for ef in existing_files:
+                update.delete_data_file(ef)
+            for df in data_files:
+                update.append_data_file(df)
+            update.commit()
+    else:
+        with table.transaction() as txn:
+            update = txn.update_snapshot().fast_append()
+            for df in data_files:
+                update.append_data_file(df)
+            update.commit()
+
     logger.debug(
-        f"pyiceberg: {write_disposition} arrow with {data.num_rows} rows to table {table.name()} at"
-        f" location {table.location()} took {(precise_time() - start_ts)} seconds."
+        f"pyiceberg: streamed {write_disposition} with {total_rows} rows in {batch_count}"
+        f" batches ({len(data_files)} data files) to table {table.name()} at location"
+        f" {table.location()} took {(precise_time() - start_ts)} seconds."
+    )
+
+
+def stream_iceberg_files(
+    table: IcebergTable,
+    file_paths: List[str],
+    write_disposition: TWriteDisposition,
+    batch_size: int = 10_000,
+) -> None:
+    """Streams local parquet files to Iceberg one file at a time with constant memory.
+
+    Reads one file → processes one batch → uploads to S3 → frees memory → next batch.
+    Only file path metadata is accumulated. Single atomic Iceberg commit at the end.
+    """
+    import gc
+    import uuid
+    import tempfile
+
+    import pyarrow.parquet as pq
+    from pyiceberg.io.pyarrow import parquet_files_to_data_files
+
+    start_ts = precise_time()
+    last_log_ts = start_ts
+    data_location = f"{table.location()}/data"
+    s3_paths: List[str] = []
+    total_rows = 0
+    n_files = len(file_paths)
+
+    logger.info(
+        f"pyiceberg: streaming {n_files} source files to {data_location}"
+    )
+
+    for file_idx, file_path in enumerate(file_paths):
+        pf = pq.ParquetFile(file_path)
+        file_rows = 0
+
+        logger.info(
+            f"pyiceberg: [{file_idx + 1}/{n_files}] reading {file_path}"
+        )
+
+        for batch_idx, batch in enumerate(pf.iter_batches(batch_size=batch_size)):
+            batch_table = ensure_iceberg_compatible_arrow_data(
+                pa.Table.from_batches([batch])
+            )
+
+            temp_path = tempfile.mktemp(suffix=".parquet")
+            pq.write_table(batch_table, temp_path, compression="snappy")
+
+            s3_path = f"{data_location}/{file_idx:04d}-{batch_idx:04d}-{uuid.uuid4().hex[:8]}.parquet"
+            with open(temp_path, "rb") as fh:
+                output = table.io.new_output(s3_path)
+                with output.create() as s3_file:
+                    s3_file.write(fh.read())
+
+            os.remove(temp_path)
+            s3_paths.append(s3_path)
+            file_rows += batch_table.num_rows
+
+            del batch_table, batch
+
+            now = precise_time()
+            if now - last_log_ts >= 10:
+                elapsed = now - start_ts
+                rate = (total_rows + file_rows) / elapsed if elapsed > 0 else 0
+                logger.info(
+                    f"pyiceberg: progress {total_rows + file_rows:,} rows"
+                    f" | {len(s3_paths)} data files | {elapsed:.0f}s"
+                    f" | {rate:,.0f} rows/s | file {file_idx + 1}/{n_files}"
+                )
+                last_log_ts = now
+
+        total_rows += file_rows
+        del pf
+        gc.collect()
+
+        elapsed = precise_time() - start_ts
+        logger.info(
+            f"pyiceberg: [{file_idx + 1}/{n_files}] done — {file_rows:,} rows"
+            f" | total: {total_rows:,} | {len(s3_paths)} data files | {elapsed:.0f}s"
+        )
+
+    logger.info(
+        f"pyiceberg: all files streamed — committing {len(s3_paths)} data files..."
+    )
+
+    table = table.refresh()
+
+    data_files = list(
+        parquet_files_to_data_files(
+            io=table.io,
+            table_metadata=table.metadata,
+            file_paths=s3_paths,
+        )
+    )
+
+    if write_disposition == "replace":
+        existing_files = []
+        if table.current_snapshot():
+            existing_files = [task.file for task in table.scan().plan_files()]
+
+        with table.transaction() as txn:
+            update = txn.update_snapshot().overwrite()
+            for ef in existing_files:
+                update.delete_data_file(ef)
+            for df in data_files:
+                update.append_data_file(df)
+            update.commit()
+    else:
+        with table.transaction() as txn:
+            update = txn.update_snapshot().fast_append()
+            for df in data_files:
+                update.append_data_file(df)
+            update.commit()
+
+    elapsed = precise_time() - start_ts
+    logger.info(
+        f"pyiceberg: committed {write_disposition} — {n_files} source files"
+        f" → {total_rows:,} rows, {len(data_files)} data files"
+        f" to {table.name()} in {elapsed:.1f}s"
     )
 
 
 def merge_iceberg_table(
     table: IcebergTable,
-    data: pa.Table,
+    data: Union[pa.Table, pa.RecordBatchReader],
     schema: TTableSchema,
     load_table_name: str,
 ) -> None:
-    """Merges in-memory Arrow data into on-disk Iceberg table."""
+    """Merges Arrow data into on-disk Iceberg table. Accepts pa.Table or streaming RecordBatchReader."""
     strategy = schema["x-merge-strategy"]  # type: ignore[typeddict-item]
     if strategy == "upsert":
-        # evolve schema
+        if isinstance(data, pa.RecordBatchReader):
+            arrow_schema = ensure_iceberg_compatible_arrow_schema(data.schema)
+        else:
+            arrow_schema = ensure_iceberg_compatible_arrow_schema(data.schema)
+
         with table.update_schema() as update:
-            update.union_by_name(ensure_iceberg_compatible_arrow_schema(data.schema))
+            update.union_by_name(arrow_schema)
 
         if "parent" in schema:
             join_cols = [get_first_column_name_with_prop(schema, "unique")]
         else:
             join_cols = get_columns_names_with_prop(schema, "primary_key")
 
-        # TODO: replace the batching method with transaction with pyiceberg's release after 0.9.1
-        for rb in data.to_batches(max_chunksize=1_000):
-            batch_tbl = pa.Table.from_batches([rb])
-            batch_tbl = ensure_iceberg_compatible_arrow_data(batch_tbl)
-
-            table.upsert(
-                df=batch_tbl,
-                join_cols=join_cols,
-                when_matched_update_all=True,
-                when_not_matched_insert_all=True,
-                case_sensitive=True,
-            )
+        if isinstance(data, pa.RecordBatchReader):
+            for batch in data:
+                batch_tbl = ensure_iceberg_compatible_arrow_data(
+                    pa.Table.from_batches([batch])
+                )
+                table.upsert(
+                    df=batch_tbl,
+                    join_cols=join_cols,
+                    when_matched_update_all=True,
+                    when_not_matched_insert_all=True,
+                    case_sensitive=True,
+                )
+                del batch_tbl
+        else:
+            # TODO: replace the batching method with transaction with pyiceberg's release after 0.9.1
+            for rb in data.to_batches(max_chunksize=1_000):
+                batch_tbl = pa.Table.from_batches([rb])
+                batch_tbl = ensure_iceberg_compatible_arrow_data(batch_tbl)
+                table.upsert(
+                    df=batch_tbl,
+                    join_cols=join_cols,
+                    when_matched_update_all=True,
+                    when_not_matched_insert_all=True,
+                    case_sensitive=True,
+                )
     else:
         raise ValueError(
             f'Merge strategy "{strategy}" is not supported for Iceberg tables. '
