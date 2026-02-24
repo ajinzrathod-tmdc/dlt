@@ -222,7 +222,8 @@ def stream_iceberg_files(
                 pa.Table.from_batches([batch])
             )
 
-            temp_path = tempfile.mktemp(suffix=".parquet")
+            fd, temp_path = tempfile.mkstemp(suffix=".parquet")
+            os.close(fd)
             pq.write_table(batch_table, temp_path, compression="snappy")
 
             s3_path = f"{data_location}/{file_idx:04d}-{batch_idx:04d}-{uuid.uuid4().hex[:8]}.parquet"
@@ -308,10 +309,7 @@ def merge_iceberg_table(
     """Merges Arrow data into on-disk Iceberg table. Accepts pa.Table or streaming RecordBatchReader."""
     strategy = schema["x-merge-strategy"]  # type: ignore[typeddict-item]
     if strategy == "upsert":
-        if isinstance(data, pa.RecordBatchReader):
-            arrow_schema = ensure_iceberg_compatible_arrow_schema(data.schema)
-        else:
-            arrow_schema = ensure_iceberg_compatible_arrow_schema(data.schema)
+        arrow_schema = ensure_iceberg_compatible_arrow_schema(data.schema)
 
         with table.update_schema() as update:
             update.union_by_name(arrow_schema)
