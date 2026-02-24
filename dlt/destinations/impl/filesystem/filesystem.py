@@ -232,25 +232,23 @@ class DeltaLoadFilesystemJob(TableFormatLoadFilesystemJob):
 class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
     def run(self) -> None:
         import gc
-        import pyarrow.parquet as pq
         from dlt.common.libs.pyarrow import pyarrow as pa
         from dlt.common.libs.pyiceberg import (
             write_iceberg_table,
             merge_iceberg_table,
             create_table,
-            stream_iceberg_files,
         )
         from dlt.destinations.impl.filesystem.iceberg_partition_spec import (
             build_iceberg_partition_spec,
         )
 
+        source_ds = self.arrow_dataset
+        schema = source_ds.schema
+
         logger.info(
             f"Will copy file(s) {self.file_paths} to iceberg table"
             f" {self.make_remote_url()} [arrow buffer: {pa.total_allocated_bytes()}]"
         )
-
-        # Read schema from first file without loading data
-        schema = pq.read_schema(self.file_paths[0])
 
         try:
             table = self._job_client.load_open_table(
@@ -282,33 +280,31 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
                     table_location=location,
                     schema=schema,
                 )
+            del source_ds
             self.run()
             return
 
         del schema
         gc.collect()
 
-        if self._load_table["write_disposition"] == "merge" and table is not None:
-            # Merge still needs data in memory — stream batch by batch
-            source_ds = self.arrow_dataset
-            with source_ds.scanner(
-                batch_readahead=0, fragment_readahead=0, use_threads=False
-            ).to_reader() as arrow_rbr:
+        with source_ds.scanner(
+            batch_readahead=0, fragment_readahead=0, use_threads=False
+        ).to_reader() as arrow_rbr:
+            if self._load_table["write_disposition"] == "merge" and table is not None:
                 merge_iceberg_table(
                     table=table,
                     data=arrow_rbr,
                     schema=self._load_table,
                     load_table_name=self.load_table_name,
                 )
-            del source_ds
-        else:
-            # Append/replace: stream files one at a time to S3, single atomic commit
-            stream_iceberg_files(
-                table=table,
-                file_paths=self.file_paths,
-                write_disposition=self._load_table["write_disposition"],
-            )
+            else:
+                write_iceberg_table(
+                    table=table,
+                    data=arrow_rbr,
+                    write_disposition=self._load_table["write_disposition"],
+                )
 
+        del source_ds
         gc.collect()
         logger.info(
             f"Copied {self.file_paths} to iceberg table {self.make_remote_url()}"
