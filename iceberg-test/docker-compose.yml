@@ -1,0 +1,94 @@
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: dlt-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: dlt-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 admin password &&
+      mc mb local/warehouse --ignore-existing &&
+      echo 'Bucket warehouse created'
+      "
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:latest
+    container_name: dlt-iceberg-rest
+    ports:
+      - "8181:8181"
+    environment:
+      - CATALOG_WAREHOUSE=s3://warehouse
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+      - CATALOG_S3_ACCESS__KEY__ID=admin
+      - CATALOG_S3_SECRET__ACCESS__KEY=password
+      - CATALOG_S3_PATH__STYLE__ACCESS=true
+      - AWS_REGION=us-east-1
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # dlt loader — runs with memory limit to safely test OOM
+  dlt-loader:
+    build:
+      context: .
+      dockerfile: Dockerfile.loader
+    container_name: dlt-loader
+    environment:
+      # PyIceberg REST catalog
+      - PYICEBERG_CATALOG__DEFAULT__URI=http://iceberg-rest:8181
+      - PYICEBERG_CATALOG__DEFAULT__WAREHOUSE=s3://warehouse
+      - PYICEBERG_CATALOG__DEFAULT__S3__ENDPOINT=http://minio:9000
+      - PYICEBERG_CATALOG__DEFAULT__S3__ACCESS_KEY_ID=admin
+      - PYICEBERG_CATALOG__DEFAULT__S3__SECRET_ACCESS_KEY=password
+      - PYICEBERG_CATALOG__DEFAULT__S3__REGION=us-east-1
+      - PYICEBERG_CATALOG__DEFAULT__S3__PATH_STYLE_ACCESS=true
+      # dlt Iceberg catalog selection
+      - ICEBERG_CATALOG__ICEBERG_CATALOG_TYPE=rest
+      - ICEBERG_CATALOG__ICEBERG_CATALOG_NAME=default
+      # AWS / MinIO credentials
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_ENDPOINT_URL_S3=http://minio:9000
+      - AWS_REGION=us-east-1
+      - BUCKET_URL=s3://warehouse/my-lake
+      # Defaults (override when running manually inside container)
+      - LIMIT_FILES=0
+      - BATCH_SIZE=10000
+    volumes:
+      - ./parquet_output:/app/parquet_output:ro
+      - ./cleanup.sh:/app/cleanup.sh:ro
+      - ./test_large_parquet_docker.py:/app/test_large_parquet_docker.py:ro
+      # Mount local dlt source so code changes are reflected instantly
+      - ../dlt:/usr/local/lib/python3.11/site-packages/dlt
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    depends_on:
+      - iceberg-rest
+      - minio
+    # Keep container running so you can exec into it
+    command: tail -f /dev/null
+
+volumes:
+  minio-data:
